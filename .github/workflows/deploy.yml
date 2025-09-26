@@ -44,6 +44,20 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+
+      - name: Register resource providers (App, MySQL, Log Analytics)
+        run: |
+          set -e
+          for NS in Microsoft.App Microsoft.DBforMySQL Microsoft.OperationalInsights; do
+            echo "Registering $NS..."
+            az provider register --namespace $NS --wait
+            echo -n "$NS state: "
+            az provider show --namespace $NS --query "registrationState" -o tsv
+          done
+
+
+
+
       - name: Ensure Resource Group
         run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }} --only-show-errors -o none
 
