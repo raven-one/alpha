@@ -73,7 +73,6 @@ jobs:
               --retention-time 30 \
               --only-show-errors -o none
           fi
-          # Fetch keys (retry for eventual consistency)
           for i in {1..10}; do
             LA_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$LA" --query customerId -o tsv) && \
             LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$LA" --query primarySharedKey -o tsv) && \
@@ -102,7 +101,7 @@ jobs:
             az mysql flexible-server create \
               -g "$RG" -n "$MYSQL" -l "$LOC" \
               --admin-user "$DBU" --admin-password "$DBP" \
-              --sku-name Standard_B1ms --storage-size 20 --version 8.0 \
+              --sku-name Standard_B1ms --storage-size 20 --version 8.0.21 \
               --public-access 0.0.0.0-255.255.255.255 \
               --only-show-errors -o none
           fi
@@ -164,4 +163,21 @@ jobs:
 
       - name: Show outputs
         run: |
-          APP_FQDN=$(az containerapp show -g $_
+          APP_FQDN=$(az containerapp show -g ${{ github.event.inputs.rg }} -n mead-app --query "properties.configuration.ingress.fqdn" -o tsv)
+          MYSQL_FQDN=$(az mysql flexible-server show -g ${{ github.event.inputs.rg }} -n mead-mysql --query fullyQualifiedDomainName -o tsv)
+          echo "App: https://${APP_FQDN}"
+          echo "DB:  ${MYSQL_FQDN}"
+          {
+            echo "### Deployment outputs"
+            echo ""
+            echo "- **App**: https://${APP_FQDN}"
+            echo "- **DB**:  ${MYSQL_FQDN}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Optional: stop MySQL (save cost)
+        if: ${{ github.event.inputs.stopMysql == 'true' }}
+        run: az mysql flexible-server stop -g ${{ github.event.inputs.rg }} -n mead-mysql --only-show-errors -o none
+
+      - name: Optional: delete RG (clean up everything)
+        if: ${{ github.event.inputs.cleanup == 'true' }}
+        run: az group delete -n ${{ github.event.inputs.rg }} --yes --no-wait
