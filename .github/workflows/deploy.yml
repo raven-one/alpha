@@ -164,9 +164,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Optional: stop MySQL (save cost)
-        if: ${{ github.event.inputs.stopMysql == 'true' }}
-        run: az mysql flexible-server stop -g ${{ github.event.inputs.rg }} -n mead-mysql --only-show-errors -o none
+        if: ${{ inputs.stopMysql == 'true' }}
+        run: az mysql flexible-server stop -g ${{ inputs.rg }} -n mead-mysql --only-show-errors -o none
 
       - name: Optional: delete RG (clean up everything)
-        if: ${{ github.event.inputs.cleanup == 'true' }}
-        run: az group delete -n ${{ github.event.inputs.rg }} --yes --no-wait
+        if: ${{ inputs.cleanup == 'true' }}
+        run: az group delete -n ${{ inputs.rg }} --yes --no-wait
