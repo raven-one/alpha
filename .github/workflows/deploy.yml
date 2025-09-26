@@ -16,7 +16,7 @@ on:
         required: true
         default: 'avenr/aca-nginx-php:mead-sql'
       stopMysql:
-        description: 'Stop MySQL after deploy (save $$)'
+        description: 'Stop MySQL after deploy (save cost)'
         required: true
         default: 'false'
       cleanup:
@@ -57,23 +57,35 @@ jobs:
       - name: Ensure Resource Group
         run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }} --only-show-errors -o none
 
+      # --- Log Analytics (needed by Container Apps env) ---
       - name: Create Log Analytics (for Container Apps env)
         id: la
+        env:
+          RG:  ${{ github.event.inputs.rg }}
+          LOC: ${{ github.event.inputs.location }}
         run: |
           set -e
-          RG="${{ github.event.inputs.rg }}"
-          LOC="${{ github.event.inputs.location }}"
           LA="${RG}-law"
-
-          # idempotent
           if ! az monitor log-analytics workspace show -g "$RG" -n "$LA" -o none 2>/dev/null; then
-            az monitor log-analytics workspace create -g "$RG" -n "$LA" -l "$LOC" --retention-time 7 --only-show-errors -o none
+            az monitor log-analytics workspace create \
+              -g "$RG" -n "$LA" -l "$LOC" \
+              --sku PerGB2018 \
+              --retention-time 30 \
+              --only-show-errors -o none
           fi
-          LA_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$LA" --query customerId -o tsv)
-          LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$LA" --query primarySharedKey -o tsv)
+          # Fetch keys (retry for eventual consistency)
+          for i in {1..10}; do
+            LA_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$LA" --query customerId -o tsv) && \
+            LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$LA" --query primarySharedKey -o tsv) && \
+            break || sleep 10
+          done
+          if [ -z "$LA_ID" ] || [ -z "$LA_KEY" ]; then
+            echo "Failed to obtain Log Analytics keys"; exit 1
+          fi
           echo "LA_ID=$LA_ID"   >> $GITHUB_OUTPUT
           echo "LA_KEY=$LA_KEY" >> $GITHUB_OUTPUT
 
+      # --- MySQL Flexible Server (cheap B1ms + 20GB) ---
       - name: Create MySQL Flexible Server (+ DB + firewall)
         id: mysql
         env:
@@ -86,7 +98,6 @@ jobs:
           MYSQL="mead-mysql"
           DBNAME="contactforms"
 
-          # If server doesn't exist, create it (cheap B1ms, 20GB)
           if ! az mysql flexible-server show -g "$RG" -n "$MYSQL" -o none 2>/dev/null; then
             az mysql flexible-server create \
               -g "$RG" -n "$MYSQL" -l "$LOC" \
@@ -96,23 +107,22 @@ jobs:
               --only-show-errors -o none
           fi
 
-          # Ensure database exists
+          # Ensure DB exists (idempotent)
           az mysql flexible-server db create -g "$RG" -s "$MYSQL" -d "$DBNAME" --only-show-errors -o none || true
 
           MYSQL_FQDN=$(az mysql flexible-server show -g "$RG" -n "$MYSQL" --query fullyQualifiedDomainName -o tsv)
           echo "MYSQL_FQDN=$MYSQL_FQDN" >> $GITHUB_OUTPUT
 
+      # --- Container Apps Environment + App (0.5 vCPU / 1Gi, scale to zero) ---
       - name: Create Container Apps Environment
-        id: env
         env:
-          RG:  ${{ github.event.inputs.rg }}
-          LOC: ${{ github.event.inputs.location }}
+          RG:   ${{ github.event.inputs.rg }}
+          LOC:  ${{ github.event.inputs.location }}
           LA_ID:  ${{ steps.la.outputs.LA_ID }}
           LA_KEY: ${{ steps.la.outputs.LA_KEY }}
         run: |
           set -e
           ENV="mead-env"
-
           if ! az containerapp env show -g "$RG" -n "$ENV" -o none 2>/dev/null; then
             az containerapp env create \
               -g "$RG" -n "$ENV" -l "$LOC" \
@@ -132,7 +142,6 @@ jobs:
           set -e
           APP="mead-app"
           ENV="mead-env"
-
           if ! az containerapp show -g "$RG" -n "$APP" -o none 2>/dev/null; then
             az containerapp create \
               -g "$RG" -n "$APP" \
@@ -140,4 +149,19 @@ jobs:
               --image "$IMG" \
               --ingress external --target-port 80 \
               --secrets db-pass="$DBP" \
-              --env-vars DB_HOST="$DBH" DB_PORT=33
+              --env-vars DB_HOST="$DBH" DB_PORT=3306 DB_NAME=contactforms DB_USER="$DBU" DB_PASS=secretref:db-pass \
+              --cpu 0.5 --memory 1Gi \
+              --min-replicas 0 --max-replicas 1 \
+              --only-show-errors -o none
+          else
+            az containerapp update \
+              -g "$RG" -n "$APP" \
+              --image "$IMG" \
+              --set-env-vars DB_HOST="$DBH" DB_PORT=3306 DB_NAME=contactforms DB_USER="$DBU" DB_PASS=secretref:db-pass \
+              --secrets db-pass="$DBP" \
+              --only-show-errors -o none
+          fi
+
+      - name: Show outputs
+        run: |
+          APP_FQDN=$(az containerapp show -g $_
