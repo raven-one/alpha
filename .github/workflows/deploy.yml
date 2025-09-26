@@ -27,6 +27,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Keep az + bicep fresh on the runner and ensure containerapp ext exists
+      - name: Ensure latest Azure CLI + Bicep + extensions
+        run: |
+          set -e
+          az --version
+          az upgrade --yes
+          az bicep install
+          az bicep upgrade
+          az extension add --upgrade -n containerapp || az extension update -n containerapp
+
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -35,10 +45,11 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Ensure Resource Group
-        run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }}
+        run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }} --only-show-errors -o none
 
       - name: Deploy Bicep (MySQL + ACA)
         run: |
+          set -e
           az deployment group create -g ${{ github.event.inputs.rg }} \
             -f infra/main.bicep \
             -p location=${{ github.event.inputs.location }} \
@@ -47,10 +58,12 @@ jobs:
                dbAdminUser='${{ secrets.DB_ADMIN_USER }}' \
                dbAdminPassword='${{ secrets.DB_ADMIN_PASSWORD }}' \
                dbName='contactforms' \
-               allowAllIps=true
+               allowAllIps=true \
+            --only-show-errors -o none
 
       - name: Show outputs
         run: |
+          set -e
           APP_FQDN=$(az containerapp show -g ${{ github.event.inputs.rg }} -n mead-app --query "properties.configuration.ingress.fqdn" -o tsv)
           MYSQL_FQDN=$(az mysql flexible-server show -g ${{ github.event.inputs.rg }} -n mead-mysql --query fullyQualifiedDomainName -o tsv)
           echo "App: https://${APP_FQDN}"
