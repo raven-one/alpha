@@ -1,0 +1,63 @@
+name: Deploy (ACA + MySQL) — Deploy-only
+
+on:
+  workflow_dispatch:
+    inputs:
+      rg:
+        description: 'Resource Group'
+        required: true
+        default: 'mead-rg'
+      location:
+        description: 'Azure region'
+        required: true
+        default: 'northeurope'
+      imageRef:
+        description: 'Public image (e.g. avenr/aca-nginx-php:mead-sql)'
+        required: true
+        default: 'avenr/aca-nginx-php:mead-sql'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Resource Group
+        run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }}
+
+      - name: Deploy Bicep (MySQL + ACA)
+        run: |
+          az deployment group create -g ${{ github.event.inputs.rg }} \
+            -f infra/main.bicep \
+            -p location=${{ github.event.inputs.location }} \
+               namePrefix=mead \
+               containerImage='${{ github.event.inputs.imageRef }}' \
+               dbAdminUser='${{ secrets.DB_ADMIN_USER }}' \
+               dbAdminPassword='${{ secrets.DB_ADMIN_PASSWORD }}' \
+               dbName='contactforms' \
+               allowAllIps=true
+
+      - name: Show outputs
+        run: |
+          APP_FQDN=$(az containerapp show -g ${{ github.event.inputs.rg }} -n mead-app --query "properties.configuration.ingress.fqdn" -o tsv)
+          MYSQL_FQDN=$(az mysql flexible-server show -g ${{ github.event.inputs.rg }} -n mead-mysql --query fullyQualifiedDomainName -o tsv)
+          echo "App: https://${APP_FQDN}"
+          echo "DB:  ${MYSQL_FQDN}"
+          {
+            echo "### Deployment outputs"
+            echo ""
+            echo "- **App**: https://${APP_FQDN}"
+            echo "- **DB**:  ${MYSQL_FQDN}"
+          } >> "$GITHUB_STEP_SUMMARY"
