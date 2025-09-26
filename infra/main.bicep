@@ -20,7 +20,7 @@ param dbName string = 'contactforms'
 @description('Allow ALL IPs to DB (ONLY for short-lived testing)')
 param allowAllIps bool = true
 
-@description('Optional: client IP to allow (e.g., your laptop public IP). Used only when allowAllIps = false')
+@description('Optional: client IP to allow (used only when allowAllIps=false)')
 param clientIp string = ''
 
 @description('Container CPU cores')
@@ -28,6 +28,21 @@ param containerCpu int = 1
 
 @description('Container memory in Gi')
 param containerMemoryGi int = 2
+
+// --- Log Analytics (needed for Container Apps env when using ARM/Bicep) ---
+resource law 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
+  name: '${namePrefix}-law'
+  location: location
+  sku: { name: 'PerGB2018' }
+  properties: {
+    retentionInDays: 7
+    publicNetworkAccessForIngestion: 'Enabled'
+    publicNetworkAccessForQuery: 'Enabled'
+  }
+}
+
+var laCustomerId = law.properties.customerId
+var laSharedKey = listKeys(law.id, '2020-08-01').primarySharedKey
 
 // --- MySQL Flexible Server ---
 resource mysqlServer 'Microsoft.DBforMySQL/flexibleServers@2023-12-01' = {
@@ -41,29 +56,24 @@ resource mysqlServer 'Microsoft.DBforMySQL/flexibleServers@2023-12-01' = {
     version: '8.0.21'
     administratorLogin: dbAdminUser
     administratorLoginPassword: dbAdminPassword
-    storage: {
-      storageSizeGB: 20
-    }
-    network: {
-      publicNetworkAccess: 'Enabled'
-    }
+    storage: { storageSizeGB: 20 }
+    network: { publicNetworkAccess: 'Enabled' }
     backup: {
       backupRetentionDays: 7
       geoRedundantBackup: 'Disabled'
     }
-    highAvailability: {
-      mode: 'Disabled'
-    }
+    highAvailability: { mode: 'Disabled' }
   }
 }
 
 resource mysqlDb 'Microsoft.DBforMySQL/flexibleServers/databases@2023-12-01' = {
-  name: '${mysqlServer.name}/${dbName}'
+  name: dbName
+  parent: mysqlServer
 }
 
-// Firewall rules (demo/wide vs. specific IP)
 resource fwAll 'Microsoft.DBforMySQL/flexibleServers/firewallRules@2023-12-01' = if (allowAllIps) {
-  name: '${mysqlServer.name}/allowAll'
+  name: 'allowAll'
+  parent: mysqlServer
   properties: {
     startIpAddress: '0.0.0.0'
     endIpAddress: '255.255.255.255'
@@ -71,20 +81,29 @@ resource fwAll 'Microsoft.DBforMySQL/flexibleServers/firewallRules@2023-12-01' =
 }
 
 resource fwClient 'Microsoft.DBforMySQL/flexibleServers/firewallRules@2023-12-01' = if (!allowAllIps && clientIp != '') {
-  name: '${mysqlServer.name}/allowClient'
+  name: 'allowClient'
+  parent: mysqlServer
   properties: {
     startIpAddress: clientIp
     endIpAddress: clientIp
   }
 }
 
-// Resolve MySQL FQDN via reference() since type definitions may be missing on runners
 var mysqlFqdn = reference(mysqlServer.id, '2023-12-01').fullyQualifiedDomainName
 
-// --- Container Apps Environment ---
+// --- Container Apps Environment (with Log Analytics) ---
 resource caEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: '${namePrefix}-env'
   location: location
+  properties: {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: laCustomerId
+        sharedKey: laSharedKey
+      }
+    }
+  }
 }
 
 // --- Container App ---
@@ -94,17 +113,8 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
   properties: {
     managedEnvironmentId: caEnv.id
     configuration: {
-      ingress: {
-        external: true
-        targetPort: 80
-        transport: 'auto'
-      }
-      secrets: [
-        {
-          name: 'db-pass'
-          value: dbAdminPassword
-        }
-      ]
+      ingress: { external: true, targetPort: 80, transport: 'auto' }
+      secrets: [{ name: 'db-pass', value: dbAdminPassword }]
     }
     template: {
       containers: [
@@ -118,16 +128,10 @@ resource app 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'DB_USER', value: dbAdminUser }
             { name: 'DB_PASS', secretRef: 'db-pass' }
           ]
-          resources: {
-            cpu: containerCpu
-            memory: '${containerMemoryGi}Gi'
-          }
+          resources: { cpu: containerCpu, memory: '${containerMemoryGi}Gi' }
         }
       ]
-      scale: {
-        minReplicas: 0
-        maxReplicas: 1
-      }
+      scale: { minReplicas: 0, maxReplicas: 1 }
     }
   }
 }
