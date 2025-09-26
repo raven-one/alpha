@@ -1,4 +1,4 @@
-name: Deploy (ACA + MySQL) — Deploy-only
+name: Deploy (ACA + MySQL) — CLI path
 
 on:
   workflow_dispatch:
@@ -15,6 +15,14 @@ on:
         description: 'Public image (e.g. avenr/aca-nginx-php:mead-sql)'
         required: true
         default: 'avenr/aca-nginx-php:mead-sql'
+      stopMysql:
+        description: 'Stop MySQL after deploy (save $$)'
+        required: true
+        default: 'false'
+      cleanup:
+        description: 'Delete the whole RG after deploy (DANGEROUS)'
+        required: true
+        default: 'false'
 
 jobs:
   deploy:
@@ -27,14 +35,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Keep az + bicep fresh on the runner and ensure containerapp ext exists
-      - name: Ensure latest Azure CLI + Bicep + extensions
+      - name: Ensure latest Azure CLI + extensions
         run: |
-          set -e
-          az --version
           az upgrade --yes
-          az bicep install
-          az bicep upgrade
           az extension add --upgrade -n containerapp || az extension update -n containerapp
 
       - name: Azure Login (OIDC)
@@ -44,67 +47,97 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-
       - name: Register resource providers (App, MySQL, Log Analytics)
         run: |
           set -e
           for NS in Microsoft.App Microsoft.DBforMySQL Microsoft.OperationalInsights; do
-            echo "Registering $NS..."
             az provider register --namespace $NS --wait
-            echo -n "$NS state: "
-            az provider show --namespace $NS --query "registrationState" -o tsv
           done
-
-
-
 
       - name: Ensure Resource Group
         run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }} --only-show-errors -o none
 
-      - name: Deploy Bicep (MySQL + ACA)
-        shell: bash
+      - name: Create Log Analytics (for Container Apps env)
+        id: la
+        run: |
+          set -e
+          RG="${{ github.event.inputs.rg }}"
+          LOC="${{ github.event.inputs.location }}"
+          LA="${RG}-law"
+
+          # idempotent
+          if ! az monitor log-analytics workspace show -g "$RG" -n "$LA" -o none 2>/dev/null; then
+            az monitor log-analytics workspace create -g "$RG" -n "$LA" -l "$LOC" --retention-time 7 --only-show-errors -o none
+          fi
+          LA_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$LA" --query customerId -o tsv)
+          LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$LA" --query primarySharedKey -o tsv)
+          echo "LA_ID=$LA_ID"   >> $GITHUB_OUTPUT
+          echo "LA_KEY=$LA_KEY" >> $GITHUB_OUTPUT
+
+      - name: Create MySQL Flexible Server (+ DB + firewall)
+        id: mysql
         env:
-          RG: ${{ github.event.inputs.rg }}
+          RG:  ${{ github.event.inputs.rg }}
           LOC: ${{ github.event.inputs.location }}
-          IMG: ${{ github.event.inputs.imageRef }}
           DBU: ${{ secrets.DB_ADMIN_USER }}
           DBP: ${{ secrets.DB_ADMIN_PASSWORD }}
         run: |
-          set +e
-          az deployment group create -g "$RG" \
-            --name "run-${{ github.run_id }}" \
-            -f infra/main.bicep \
-            -p location="$LOC" \
-               namePrefix=mead \
-               containerImage="$IMG" \
-               dbAdminUser="$DBU" \
-               dbAdminPassword="$DBP" \
-               dbName='contactforms' \
-               allowAllIps=true \
-            --only-show-errors -o none
-          DEPLOY_RC=$?
           set -e
+          MYSQL="mead-mysql"
+          DBNAME="contactforms"
 
-          echo "Deployment exit code: $DEPLOY_RC (ignoring if resources exist)"
-
-          # Verify resources actually exist; these will fail if not created
-          az mysql flexible-server show -g "$RG" -n mead-mysql -o none
-          az containerapp show -g "$RG" -n mead-app -o none
-
-          if [ "$DEPLOY_RC" -ne 0 ]; then
-            echo "NOTE: CLI returned non-zero but resources are present (known az bug). Continuing."
+          # If server doesn't exist, create it (cheap B1ms, 20GB)
+          if ! az mysql flexible-server show -g "$RG" -n "$MYSQL" -o none 2>/dev/null; then
+            az mysql flexible-server create \
+              -g "$RG" -n "$MYSQL" -l "$LOC" \
+              --admin-user "$DBU" --admin-password "$DBP" \
+              --sku-name Standard_B1ms --storage-size 20 --version 8.0 \
+              --public-access 0.0.0.0-255.255.255.255 \
+              --only-show-errors -o none
           fi
 
-      - name: Show outputs
+          # Ensure database exists
+          az mysql flexible-server db create -g "$RG" -s "$MYSQL" -d "$DBNAME" --only-show-errors -o none || true
+
+          MYSQL_FQDN=$(az mysql flexible-server show -g "$RG" -n "$MYSQL" --query fullyQualifiedDomainName -o tsv)
+          echo "MYSQL_FQDN=$MYSQL_FQDN" >> $GITHUB_OUTPUT
+
+      - name: Create Container Apps Environment
+        id: env
+        env:
+          RG:  ${{ github.event.inputs.rg }}
+          LOC: ${{ github.event.inputs.location }}
+          LA_ID:  ${{ steps.la.outputs.LA_ID }}
+          LA_KEY: ${{ steps.la.outputs.LA_KEY }}
         run: |
           set -e
-          APP_FQDN=$(az containerapp show -g ${{ github.event.inputs.rg }} -n mead-app --query "properties.configuration.ingress.fqdn" -o tsv)
-          MYSQL_FQDN=$(az mysql flexible-server show -g ${{ github.event.inputs.rg }} -n mead-mysql --query fullyQualifiedDomainName -o tsv)
-          echo "App: https://${APP_FQDN}"
-          echo "DB:  ${MYSQL_FQDN}"
-          {
-            echo "### Deployment outputs"
-            echo ""
-            echo "- **App**: https://${APP_FQDN}"
-            echo "- **DB**:  ${MYSQL_FQDN}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          ENV="mead-env"
+
+          if ! az containerapp env show -g "$RG" -n "$ENV" -o none 2>/dev/null; then
+            az containerapp env create \
+              -g "$RG" -n "$ENV" -l "$LOC" \
+              --logs-workspace-id "$LA_ID" \
+              --logs-workspace-key "$LA_KEY" \
+              --only-show-errors -o none
+          fi
+
+      - name: Create/Update Container App
+        env:
+          RG:   ${{ github.event.inputs.rg }}
+          IMG:  ${{ github.event.inputs.imageRef }}
+          DBU:  ${{ secrets.DB_ADMIN_USER }}
+          DBP:  ${{ secrets.DB_ADMIN_PASSWORD }}
+          DBH:  ${{ steps.mysql.outputs.MYSQL_FQDN }}
+        run: |
+          set -e
+          APP="mead-app"
+          ENV="mead-env"
+
+          if ! az containerapp show -g "$RG" -n "$APP" -o none 2>/dev/null; then
+            az containerapp create \
+              -g "$RG" -n "$APP" \
+              --environment "$ENV" \
+              --image "$IMG" \
+              --ingress external --target-port 80 \
+              --secrets db-pass="$DBP" \
+              --env-vars DB_HOST="$DBH" DB_PORT=33
