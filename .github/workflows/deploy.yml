@@ -1,26 +1,26 @@
-name: Deploy (ACA + MySQL) — CLI path
+name: Deploy ACA MySQL (CLI)
 
 on:
   workflow_dispatch:
     inputs:
       rg:
-        description: 'Resource Group'
+        description: Resource Group
         required: true
-        default: 'mead-rg'
+        default: mead-rg
       location:
-        description: 'Azure region'
+        description: Azure region
         required: true
-        default: 'northeurope'
+        default: northeurope
       imageRef:
-        description: 'Public image (e.g. avenr/aca-nginx-php:mead-sql)'
+        description: Public image (e.g. avenr/aca-nginx-php:mead-sql)
         required: true
-        default: 'avenr/aca-nginx-php:mead-sql'
+        default: avenr/aca-nginx-php:mead-sql
       stopMysql:
-        description: 'Stop MySQL after deploy (save cost)'
+        description: Stop MySQL after deploy (save cost)
         required: true
         default: 'false'
       cleanup:
-        description: 'Delete the whole RG after deploy (DANGEROUS)'
+        description: Delete the whole RG after deploy (DANGEROUS)
         required: true
         default: 'false'
 
@@ -30,10 +30,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Ensure latest Azure CLI + extensions
         run: |
@@ -57,7 +55,6 @@ jobs:
       - name: Ensure Resource Group
         run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }} --only-show-errors -o none
 
-      # --- Log Analytics (needed by Container Apps env) ---
       - name: Create Log Analytics (for Container Apps env)
         id: la
         env:
@@ -78,13 +75,10 @@ jobs:
             LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$LA" --query primarySharedKey -o tsv) && \
             break || sleep 10
           done
-          if [ -z "$LA_ID" ] || [ -z "$LA_KEY" ]; then
-            echo "Failed to obtain Log Analytics keys"; exit 1
-          fi
+          [ -z "$LA_ID" -o -z "$LA_KEY" ] && { echo "Failed to obtain Log Analytics keys"; exit 1; }
           echo "LA_ID=$LA_ID"   >> $GITHUB_OUTPUT
           echo "LA_KEY=$LA_KEY" >> $GITHUB_OUTPUT
 
-      # --- MySQL Flexible Server (cheap B1ms + 20GB) ---
       - name: Create MySQL Flexible Server (+ DB + firewall)
         id: mysql
         env:
@@ -96,7 +90,6 @@ jobs:
           set -e
           MYSQL="mead-mysql"
           DBNAME="contactforms"
-
           if ! az mysql flexible-server show -g "$RG" -n "$MYSQL" -o none 2>/dev/null; then
             az mysql flexible-server create \
               -g "$RG" -n "$MYSQL" -l "$LOC" \
@@ -105,14 +98,10 @@ jobs:
               --public-access 0.0.0.0-255.255.255.255 \
               --only-show-errors -o none
           fi
-
-          # Ensure DB exists (idempotent)
           az mysql flexible-server db create -g "$RG" -s "$MYSQL" -d "$DBNAME" --only-show-errors -o none || true
-
           MYSQL_FQDN=$(az mysql flexible-server show -g "$RG" -n "$MYSQL" --query fullyQualifiedDomainName -o tsv)
           echo "MYSQL_FQDN=$MYSQL_FQDN" >> $GITHUB_OUTPUT
 
-      # --- Container Apps Environment + App (0.5 vCPU / 1Gi, scale to zero) ---
       - name: Create Container Apps Environment
         env:
           RG:   ${{ github.event.inputs.rg }}
