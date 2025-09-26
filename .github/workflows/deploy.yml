@@ -168,7 +168,3 @@ jobs:
             echo "- **App**: https://${APP_FQDN}"
             echo "- **DB**:  ${MYSQL_FQDN}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Optional: delete RG (clean up everything)
-        if: ${{ inputs.cleanup == 'true' }}
-        run: az group delete -n ${{ inputs.rg }} --yes --no-wait
