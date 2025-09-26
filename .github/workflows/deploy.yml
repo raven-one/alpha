@@ -15,10 +15,6 @@ on:
         description: Public image (e.g. avenr/aca-nginx-php:mead-sql)
         required: true
         default: avenr/aca-nginx-php:mead-sql
-      stopMysql:
-        description: Stop MySQL after deploy (save cost)
-        required: true
-        default: 'false'
       cleanup:
         description: Delete the whole RG after deploy (DANGEROUS)
         required: true
@@ -30,8 +26,10 @@ jobs:
     permissions:
       id-token: write
       contents: read
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Ensure latest Azure CLI + extensions
         run: |
@@ -53,13 +51,14 @@ jobs:
           done
 
       - name: Ensure Resource Group
-        run: az group create -n ${{ github.event.inputs.rg }} -l ${{ github.event.inputs.location }} --only-show-errors -o none
+        run: az group create -n ${{ inputs.rg }} -l ${{ inputs.location }} --only-show-errors -o none
 
+      # --- Log Analytics (needed by Container Apps env) ---
       - name: Create Log Analytics (for Container Apps env)
         id: la
         env:
-          RG:  ${{ github.event.inputs.rg }}
-          LOC: ${{ github.event.inputs.location }}
+          RG:  ${{ inputs.rg }}
+          LOC: ${{ inputs.location }}
         run: |
           set -e
           LA="${RG}-law"
@@ -70,6 +69,7 @@ jobs:
               --retention-time 30 \
               --only-show-errors -o none
           fi
+          # fetch keys (retry for eventual consistency)
           for i in {1..10}; do
             LA_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$LA" --query customerId -o tsv) && \
             LA_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$RG" -n "$LA" --query primarySharedKey -o tsv) && \
@@ -79,17 +79,19 @@ jobs:
           echo "LA_ID=$LA_ID"   >> $GITHUB_OUTPUT
           echo "LA_KEY=$LA_KEY" >> $GITHUB_OUTPUT
 
+      # --- MySQL Flexible Server (cheap B1ms + 20GB) ---
       - name: Create MySQL Flexible Server (+ DB + firewall)
         id: mysql
         env:
-          RG:  ${{ github.event.inputs.rg }}
-          LOC: ${{ github.event.inputs.location }}
+          RG:  ${{ inputs.rg }}
+          LOC: ${{ inputs.location }}
           DBU: ${{ secrets.DB_ADMIN_USER }}
           DBP: ${{ secrets.DB_ADMIN_PASSWORD }}
         run: |
           set -e
           MYSQL="mead-mysql"
           DBNAME="contactforms"
+
           if ! az mysql flexible-server show -g "$RG" -n "$MYSQL" -o none 2>/dev/null; then
             az mysql flexible-server create \
               -g "$RG" -n "$MYSQL" -l "$LOC" \
@@ -98,14 +100,18 @@ jobs:
               --public-access 0.0.0.0-255.255.255.255 \
               --only-show-errors -o none
           fi
+
+          # Ensure DB exists (idempotent)
           az mysql flexible-server db create -g "$RG" -s "$MYSQL" -d "$DBNAME" --only-show-errors -o none || true
+
           MYSQL_FQDN=$(az mysql flexible-server show -g "$RG" -n "$MYSQL" --query fullyQualifiedDomainName -o tsv)
           echo "MYSQL_FQDN=$MYSQL_FQDN" >> $GITHUB_OUTPUT
 
+      # --- Container Apps Environment + App (0.5 vCPU / 1Gi, scale to zero) ---
       - name: Create Container Apps Environment
         env:
-          RG:   ${{ github.event.inputs.rg }}
-          LOC:  ${{ github.event.inputs.location }}
+          RG:   ${{ inputs.rg }}
+          LOC:  ${{ inputs.location }}
           LA_ID:  ${{ steps.la.outputs.LA_ID }}
           LA_KEY: ${{ steps.la.outputs.LA_KEY }}
         run: |
@@ -121,8 +127,8 @@ jobs:
 
       - name: Create/Update Container App
         env:
-          RG:   ${{ github.event.inputs.rg }}
-          IMG:  ${{ github.event.inputs.imageRef }}
+          RG:   ${{ inputs.rg }}
+          IMG:  ${{ inputs.imageRef }}
           DBU:  ${{ secrets.DB_ADMIN_USER }}
           DBP:  ${{ secrets.DB_ADMIN_PASSWORD }}
           DBH:  ${{ steps.mysql.outputs.MYSQL_FQDN }}
@@ -152,8 +158,8 @@ jobs:
 
       - name: Show outputs
         run: |
-          APP_FQDN=$(az containerapp show -g ${{ github.event.inputs.rg }} -n mead-app --query "properties.configuration.ingress.fqdn" -o tsv)
-          MYSQL_FQDN=$(az mysql flexible-server show -g ${{ github.event.inputs.rg }} -n mead-mysql --query fullyQualifiedDomainName -o tsv)
+          APP_FQDN=$(az containerapp show -g ${{ inputs.rg }} -n mead-app --query "properties.configuration.ingress.fqdn" -o tsv)
+          MYSQL_FQDN=$(az mysql flexible-server show -g ${{ inputs.rg }} -n mead-mysql --query fullyQualifiedDomainName -o tsv)
           echo "App: https://${APP_FQDN}"
           echo "DB:  ${MYSQL_FQDN}"
           {
@@ -162,10 +168,6 @@ jobs:
             echo "- **App**: https://${APP_FQDN}"
             echo "- **DB**:  ${MYSQL_FQDN}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Optional: stop MySQL (save cost)
-        if: ${{ inputs.stopMysql == 'true' }}
-        run: az mysql flexible-server stop -g ${{ inputs.rg }} -n mead-mysql --only-show-errors -o none
 
       - name: Optional: delete RG (clean up everything)
         if: ${{ inputs.cleanup == 'true' }}
