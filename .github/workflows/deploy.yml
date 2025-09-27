@@ -53,7 +53,7 @@ jobs:
       - name: Ensure Resource Group
         run: az group create -n ${{ inputs.rg }} -l ${{ inputs.location }} --only-show-errors -o none
 
-      # --- Log Analytics (needed by Container Apps env) ---
+      # Log behövs, fel uppstår annars.
       - name: Create Log Analytics (for Container Apps env)
         id: la
         env:
@@ -79,7 +79,7 @@ jobs:
           echo "LA_ID=$LA_ID"   >> $GITHUB_OUTPUT
           echo "LA_KEY=$LA_KEY" >> $GITHUB_OUTPUT
 
-      # --- MySQL Flexible Server (cheap B1ms + 20GB) ---
+      # MySQL Flexible Server cheap B1ms disk=20GB För att lagra ifyllda former
       - name: Create MySQL Flexible Server (+ DB + firewall)
         id: mysql
         env:
@@ -107,7 +107,7 @@ jobs:
           MYSQL_FQDN=$(az mysql flexible-server show -g "$RG" -n "$MYSQL" --query fullyQualifiedDomainName -o tsv)
           echo "MYSQL_FQDN=$MYSQL_FQDN" >> $GITHUB_OUTPUT
 
-      # --- Container Apps Environment + App (0.5 vCPU / 1Gi, scale to zero) ---
+      #Container Apps Environment + App 0.5 vCPU / 1Gi, scale to zero. vi får 100 gratis timmar. 
       - name: Create Container Apps Environment
         env:
           RG:   ${{ inputs.rg }}
